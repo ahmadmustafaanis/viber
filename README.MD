@@ -1,5 +1,6 @@
 ## Viber: Repository Analysis CLI Tool
 
+![Viber Logo](viber.jpeg)
 **Viber** is a command-line interface (CLI) tool designed to analyze a local code repository, generate a directory tree, extract Python class and function definitions, and scaffold placeholder docstrings using a language model API. Currently, Viber outputs a `viber.txt` report file, and future enhancements will include an agentic Q\&A workflow and automated code updates.
 
 ---
