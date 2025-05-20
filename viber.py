@@ -21,6 +21,42 @@ import openai
 # Replace this function with actual calls to your chosen LLM API
 # (e.g., OpenAI, Anthropic, local Llama)
 
+# --- Helper function for building LLM messages ---
+def _build_llm_messages(
+    system_prompt_content: str, 
+    user_prompt_initial_sections: list[str], 
+    chat_history: list[dict], 
+    user_question_section: str, 
+    user_prompt_final_sections: list[str] = None
+) -> list[dict]:
+    """
+    Constructs the 'messages' list for LLM API calls.
+    """
+    user_prompt_parts = list(user_prompt_initial_sections)
+
+    # Append Chat History
+    user_prompt_parts.append("\n--- Conversation History ---")
+    if chat_history:
+        for message in chat_history:
+            user_prompt_parts.append(f"{message['role']}: {message['content']}")
+    else:
+        user_prompt_parts.append("(No previous conversation history)")
+    user_prompt_parts.append("--- End of Conversation History ---")
+
+    # Append User Question Section
+    user_prompt_parts.append(user_question_section)
+
+    # Append Final Sections
+    if user_prompt_final_sections:
+        user_prompt_parts.extend(user_prompt_final_sections)
+    
+    final_user_prompt = "\n".join(user_prompt_parts)
+    
+    return [
+        {"role": "system", "content": system_prompt_content},
+        {"role": "user", "content": final_user_prompt}
+    ]
+
 # --- Placeholder Q&A functions ---
 def handle_qa_session(user_question: str, viber_txt_content: str, repo_path: Path, chat_history: list[dict]) -> str:
     """
@@ -92,37 +128,37 @@ Do not hallucinate file paths or entities.
 If no specific files or entities seem relevant, or if the question is not about the code, you can return an empty list for "files".
 """
 
-    user_prompt_parts = [
+    initial_sections = [
         "Here is the content of 'viber.txt', which describes the repository structure and available Python definitions:",
         "--- viber.txt content ---",
         viber_txt_content,
         "--- end of viber.txt content ---",
-        "\nGiven the viber.txt content, the current conversation history, and the user's question, please identify the most relevant code references.",
-        "\n--- Conversation History ---"
+        "\nGiven the viber.txt content, the current conversation history, and the user's question, please identify the most relevant code references."
+        # Note: The chat history block will be added by the helper.
     ]
-    if chat_history:
-        for message in chat_history:
-            user_prompt_parts.append(f"{message['role']}: {message['content']}")
-    else:
-        user_prompt_parts.append("(No previous conversation history)")
-    user_prompt_parts.append("--- End of Conversation History ---")
     
-    user_prompt_parts.append(f"\nUser Question: \"{user_question}\"")
-    user_prompt_parts.append("\nPlease return your response as a JSON object with 'rationale' and 'files' keys as described in the system prompt.")
+    question_section = f"\nUser Question: \"{user_question}\""
     
-    final_user_prompt = "\n".join(user_prompt_parts)
+    final_sections = [
+        "\nPlease return your response as a JSON object with 'rationale' and 'files' keys as described in the system prompt."
+    ]
+
+    messages = _build_llm_messages(
+        system_prompt_content=system_prompt, # system_prompt is the existing variable name
+        user_prompt_initial_sections=initial_sections,
+        chat_history=chat_history,
+        user_question_section=question_section,
+        user_prompt_final_sections=final_sections
+    )
 
     try:
         print("      [INFO] Calling LLM to get relevant code references...")
         # print(f"      [DEBUG] System Prompt: {system_prompt}") # For debugging
-        # print(f"      [DEBUG] User Prompt: {final_user_prompt}") # For debugging
+        # print(f"      [DEBUG] User Prompt built by helper: {messages[1]['content']}") # For debugging
         
         response = openai.chat.completions.create(
             model="gpt-4o", # Using gpt-4o as recommended
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": final_user_prompt},
-            ],
+            messages=messages, # Use messages from helper
             response_format={"type": "json_object"},
             max_tokens=1000, # Increased max_tokens
             temperature=0.2,
@@ -256,7 +292,7 @@ If the provided code snippets are insufficient or don't seem relevant to the que
 Do not make up information if it's not present in the provided context.
 """
 
-    user_prompt_parts = [
+    initial_sections = [
         "Here is an overview of the repository from 'viber.txt':",
         "--- viber.txt content ---",
         viber_txt_content,
@@ -264,31 +300,29 @@ Do not make up information if it's not present in the provided context.
         "\nHere are specific code snippets retrieved that might be relevant:",
         "--- Retrieved Code Snippets ---",
         retrieved_code if retrieved_code.strip() else "(No specific code snippets were retrieved or provided for this question)",
-        "--- End of Retrieved Code Snippets ---",
-        "\n--- Conversation History ---"
+        "--- End of Retrieved Code Snippets ---"
+        # Note: The chat history block will be added by the helper.
     ]
-    if chat_history:
-        for message in chat_history:
-            user_prompt_parts.append(f"{message['role']}: {message['content']}")
-    else:
-        user_prompt_parts.append("(No previous conversation history)")
-    user_prompt_parts.append("--- End of Conversation History ---")
-
-    user_prompt_parts.append(f"\nPlease answer the following question based on all the provided information:\nUser Question: \"{user_question}\"")
     
-    final_user_prompt = "\n".join(user_prompt_parts)
+    # This includes the specific framing text for the question
+    question_section = f"\nPlease answer the following question based on all the provided information:\nUser Question: \"{user_question}\""
+
+    messages = _build_llm_messages(
+        system_prompt_content=system_prompt, # system_prompt is the existing variable name
+        user_prompt_initial_sections=initial_sections,
+        chat_history=chat_history,
+        user_question_section=question_section,
+        user_prompt_final_sections=None # No final sections for this LLM call
+    )
 
     try:
         print("      [INFO] Calling LLM to get answer...")
         # print(f"      [DEBUG] System Prompt for get_answer_llm: {system_prompt}") # For debugging
-        # print(f"      [DEBUG] User Prompt for get_answer_llm: {final_user_prompt}") # For debugging
+        # print(f"      [DEBUG] User Prompt for get_answer_llm built by helper: {messages[1]['content']}") # For debugging
 
         response = openai.chat.completions.create(
             model="gpt-4o", 
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": final_user_prompt},
-            ],
+            messages=messages, # Use messages from helper
             max_tokens=1500, 
             temperature=0.5, # Using 0.5 as a balance
         )
