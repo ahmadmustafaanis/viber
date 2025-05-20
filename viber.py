@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import json # Added import
 
 import openai
 
@@ -19,6 +20,289 @@ import openai
 # --- Placeholder for LLM Interaction ---
 # Replace this function with actual calls to your chosen LLM API
 # (e.g., OpenAI, Anthropic, local Llama)
+
+# --- Placeholder Q&A functions ---
+def handle_qa_session(user_question: str, viber_txt_content: str, repo_path: Path, chat_history: list[dict]) -> str:
+    """
+    Orchestrates the Q&A process by:
+    1. Getting relevant code references from viber.txt content.
+    2. Reading the content of those references.
+    3. Generating an answer based on all available information.
+    """
+    print("  [Agent] Okay, I need to figure out which files might be relevant...")
+    code_references = get_relevant_code_references_llm(viber_txt_content, user_question, chat_history)
+    # print(f"    [DEBUG] References found: {code_references}") # Optional debug
+
+    retrieved_code = ""
+    if code_references:
+        print(f"  [Agent] I've identified {len(code_references)} potential file(s)/reference(s). Reading them now...")
+        retrieved_code_content = read_code_from_references(repo_path, code_references)
+        
+        # Check if read_code_from_references returned actual code or a message
+        # Common messages from read_code_from_references indicating no actual code:
+        no_code_messages = [
+            "No code references provided to read.", # Should not happen if code_references is true
+            "No code content could be retrieved based on the references. Files might be missing, outside the repository, or unreadable."
+        ]
+
+        if retrieved_code_content in no_code_messages or not retrieved_code_content.strip():
+            print("  [Agent] I found references, but couldn't retrieve any actual code content from them. Proceeding without specific code snippets.")
+            retrieved_code = "" # Ensure it's an empty string
+        else:
+            retrieved_code = retrieved_code_content
+            # Simple way to count snippets based on current formatting
+            snippet_count = len(retrieved_code.split("--- Content from:")) - 1 
+            print(f"  [Agent] Successfully read {snippet_count} code snippet(s).")
+            # print(f"    [DEBUG] Retrieved code:\n{retrieved_code[:500]}...") # Optional debug
+    else:
+        print("  [Agent] I couldn't identify specific code files for your question from viber.txt. I'll try to answer based on the general information and chat history.")
+        retrieved_code = "" # Ensure it's an empty string
+
+    print("  [Agent] Now, I'm formulating an answer...")
+    answer = get_answer_llm(user_question, viber_txt_content, retrieved_code, chat_history)
+    
+    return answer
+
+def get_relevant_code_references_llm(viber_txt_content: str, user_question: str, chat_history: list[dict]) -> list[dict]:
+    """
+    Identifies relevant files and entities (functions/classes) from viber.txt
+    content based on a user question and chat history using an LLM.
+
+    Args:
+        viber_txt_content: The string content of viber.txt.
+        user_question: The user's current question.
+        chat_history: A list of previous conversation turns.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents a relevant file
+        and its entities. Returns an empty list if no relevant files are found
+        or in case of an error.
+    """
+    system_prompt = """
+You are an expert code analysis assistant. Your task is to identify the specific files and, if applicable, function or class names within a software repository that are most relevant to answering a user's question. You will be given the content of 'viber.txt', which includes a directory tree and summaries of Python definitions. You will also receive the user's current question and the conversation history.
+
+Your goal is to output a JSON object with two keys:
+1.  "rationale": A brief explanation (1-2 sentences) of why you are selecting these files/entities.
+2.  "files": A list of objects, where each object has:
+    *   "path": The relative file path from the repository root (e.g., "src/main.py").
+    *   "entities": A list of strings, where each string is a function name (e.g., "my_function") or a class name (e.g., "MyClass") from that file. If the whole file is relevant, or if you are unsure about specific entities, provide an empty list [].
+
+Only list files that exist according to the 'viber.txt' directory tree.
+Do not hallucinate file paths or entities.
+If no specific files or entities seem relevant, or if the question is not about the code, you can return an empty list for "files".
+"""
+
+    user_prompt_parts = [
+        "Here is the content of 'viber.txt', which describes the repository structure and available Python definitions:",
+        "--- viber.txt content ---",
+        viber_txt_content,
+        "--- end of viber.txt content ---",
+        "\nGiven the viber.txt content, the current conversation history, and the user's question, please identify the most relevant code references.",
+        "\n--- Conversation History ---"
+    ]
+    if chat_history:
+        for message in chat_history:
+            user_prompt_parts.append(f"{message['role']}: {message['content']}")
+    else:
+        user_prompt_parts.append("(No previous conversation history)")
+    user_prompt_parts.append("--- End of Conversation History ---")
+    
+    user_prompt_parts.append(f"\nUser Question: \"{user_question}\"")
+    user_prompt_parts.append("\nPlease return your response as a JSON object with 'rationale' and 'files' keys as described in the system prompt.")
+    
+    final_user_prompt = "\n".join(user_prompt_parts)
+
+    try:
+        print("      [INFO] Calling LLM to get relevant code references...")
+        # print(f"      [DEBUG] System Prompt: {system_prompt}") # For debugging
+        # print(f"      [DEBUG] User Prompt: {final_user_prompt}") # For debugging
+        
+        response = openai.chat.completions.create(
+            model="gpt-4o", # Using gpt-4o as recommended
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": final_user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=1000, # Increased max_tokens
+            temperature=0.2,
+        )
+        
+        response_content = response.choices[0].message.content
+        # print(f"      [DEBUG] LLM raw response: {response_content}") # For debugging
+
+        try:
+            data = json.loads(response_content)
+            if isinstance(data, dict) and "files" in data and isinstance(data["files"], list):
+                # Basic validation for items within "files" list
+                validated_files = []
+                for item in data["files"]:
+                    if isinstance(item, dict) and "path" in item and "entities" in item:
+                        if isinstance(item["path"], str) and isinstance(item["entities"], list):
+                            validated_files.append(item)
+                        else:
+                            print(f"      [WARN] Invalid item structure in 'files' list: {item}", file=sys.stderr)
+                    else:
+                        print(f"      [WARN] Invalid item in 'files' list (missing 'path' or 'entities'): {item}", file=sys.stderr)
+                
+                if "rationale" in data:
+                    print(f"      [INFO] LLM Rationale: {data['rationale']}")
+                else:
+                    print("      [WARN] 'rationale' key missing from LLM response.", file=sys.stderr)
+
+                return validated_files
+            else:
+                print(f"      [ERROR] LLM response JSON structure is invalid. Expected dict with 'files' list, got: {type(data)}", file=sys.stderr)
+                print(f"      [DEBUG] Invalid JSON data: {data}", file=sys.stderr)
+                return []
+        except json.JSONDecodeError as e:
+            print(f"      [ERROR] Failed to decode LLM response as JSON: {e}", file=sys.stderr)
+            print(f"      [DEBUG] Raw response content that failed parsing: {response_content}", file=sys.stderr)
+            return []
+
+    except openai.APIError as e:
+        print(f"      [ERROR] OpenAI API error: {e}", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"      [ERROR] An unexpected error occurred in get_relevant_code_references_llm: {e}", file=sys.stderr)
+        return []
+
+def read_code_from_references(repo_path: Path, code_references: list[dict]) -> str:
+    """
+    Reads the content of files specified in code_references from the repository.
+
+    Args:
+        repo_path: The absolute Path object for the root of the repository.
+        code_references: A list of dictionaries, where each dictionary
+                         should have a "path" key (relative file path) and
+                         an optional "entities" key (list of strings).
+
+    Returns:
+        A string containing the concatenated content of the referenced files,
+        each preceded by a header. Returns a message if no content is retrieved.
+    """
+    retrieved_code_parts = []
+    resolved_repo_path = repo_path.resolve() # Resolve once for reliable comparison
+
+    if not code_references:
+        return "No code references provided to read."
+
+    for reference in code_references:
+        file_path_str = reference.get("path")
+        if not file_path_str:
+            print("      [WARN] Skipping reference due to missing 'path'.", file=sys.stderr)
+            continue
+
+        absolute_file_path = resolved_repo_path.joinpath(file_path_str).resolve()
+
+        # Security Check: Ensure the file is within the repository
+        if not str(absolute_file_path).startswith(str(resolved_repo_path)):
+            print(
+                f"      [WARN] Skipping '{file_path_str}' as it's outside the repository path: '{absolute_file_path}'",
+                file=sys.stderr
+            )
+            continue
+        
+        if not absolute_file_path.is_file():
+            print(f"      [WARN] File not found or is not a file: {absolute_file_path}", file=sys.stderr)
+            continue
+
+        try:
+            content = absolute_file_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            print(f"      [WARN] Could not read file {absolute_file_path}: {e}", file=sys.stderr)
+            continue
+
+        entities = reference.get("entities", [])
+        if entities:
+            header = f"--- Content from: {file_path_str} (Entities requested: {', '.join(entities)}) ---\n"
+        else:
+            header = f"--- Content from: {file_path_str} ---\n"
+        
+        retrieved_code_parts.append(header)
+        retrieved_code_parts.append(content)
+        retrieved_code_parts.append("\n\n") # Two newlines for separation
+
+    if not retrieved_code_parts:
+        return "No code content could be retrieved based on the references. Files might be missing, outside the repository, or unreadable."
+    
+    return "".join(retrieved_code_parts)
+
+def get_answer_llm(user_question: str, viber_txt_content: str, retrieved_code: str, chat_history: list[dict]) -> str:
+    """
+    Generates an answer to a user's question using an LLM, based on
+    viber.txt content, retrieved code snippets, and chat history.
+
+    Args:
+        user_question: The user's current question.
+        viber_txt_content: The string content of viber.txt.
+        retrieved_code: String containing specific code snippets relevant to the question.
+        chat_history: A list of previous conversation turns.
+
+    Returns:
+        A string containing the LLM's answer, or an error message.
+    """
+    system_prompt = """
+You are a knowledgeable and helpful AI assistant. Your task is to answer questions about a software repository.
+You will be provided with:
+1.  An overview of the repository structure and Python definitions (from 'viber.txt').
+2.  Specific code snippets that have been deemed relevant to the user's question.
+3.  The history of the current conversation.
+4.  The user's current question.
+
+Please synthesize all this information to provide a clear, concise, and accurate answer.
+When referring to specific code, try to mention the file path or function/class names if they are available in the provided snippets.
+If the provided code snippets are insufficient or don't seem relevant to the question, acknowledge that in your answer.
+Do not make up information if it's not present in the provided context.
+"""
+
+    user_prompt_parts = [
+        "Here is an overview of the repository from 'viber.txt':",
+        "--- viber.txt content ---",
+        viber_txt_content,
+        "--- end of viber.txt content ---",
+        "\nHere are specific code snippets retrieved that might be relevant:",
+        "--- Retrieved Code Snippets ---",
+        retrieved_code if retrieved_code.strip() else "(No specific code snippets were retrieved or provided for this question)",
+        "--- End of Retrieved Code Snippets ---",
+        "\n--- Conversation History ---"
+    ]
+    if chat_history:
+        for message in chat_history:
+            user_prompt_parts.append(f"{message['role']}: {message['content']}")
+    else:
+        user_prompt_parts.append("(No previous conversation history)")
+    user_prompt_parts.append("--- End of Conversation History ---")
+
+    user_prompt_parts.append(f"\nPlease answer the following question based on all the provided information:\nUser Question: \"{user_question}\"")
+    
+    final_user_prompt = "\n".join(user_prompt_parts)
+
+    try:
+        print("      [INFO] Calling LLM to get answer...")
+        # print(f"      [DEBUG] System Prompt for get_answer_llm: {system_prompt}") # For debugging
+        # print(f"      [DEBUG] User Prompt for get_answer_llm: {final_user_prompt}") # For debugging
+
+        response = openai.chat.completions.create(
+            model="gpt-4o", 
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": final_user_prompt},
+            ],
+            max_tokens=1500, 
+            temperature=0.5, # Using 0.5 as a balance
+        )
+        
+        answer = response.choices[0].message.content
+        return answer.strip()
+
+    except openai.APIError as e:
+        print(f"      [ERROR] OpenAI API error in get_answer_llm: {e}", file=sys.stderr)
+        return "Error: Could not get an answer from the LLM due to an API issue."
+    except Exception as e:
+        print(f"      [ERROR] An unexpected error occurred in get_answer_llm: {e}", file=sys.stderr)
+        return "Error: An unexpected issue occurred while trying to get an answer."
+# --- End Placeholder Q&A functions ---
 def generate_docstring_llm(function_signature: str, code_context: str = "") -> str:
     """
     Placeholder function to simulate LLM docstring generation.
@@ -181,29 +465,95 @@ def main():
     """Main function to orchestrate the repository analysis."""
     parser = argparse.ArgumentParser(
         description="Analyze a repository, create viber.txt with tree structure, "
-        "Python definitions, and LLM docstring placeholders."
+        "Python definitions, and LLM docstring placeholders, or run Q&A mode."
     )
     parser.add_argument(
         "--repo_path",
         type=str,
-        help="Path to the target repository directory.",
+        help="Path to the target repository directory. Required for generation and Q&A mode.",
+    )
+    parser.add_argument(
+        "--qa", action="store_true", help="Enable interactive Q&A mode."
     )
     args = parser.parse_args()
 
+    if args.qa:
+        # QA Mode
+        viber_file_path_qa = Path("viber.txt").resolve()
+
+        if not args.repo_path:
+            print("Error: --repo_path is required for Q&A mode.", file=sys.stderr)
+            sys.exit(1)
+
+        repo_path = Path(args.repo_path).resolve()
+        if not repo_path.is_dir():
+            print(
+                f"Error: Path '{repo_path}' for --repo_path is not a valid directory.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if not viber_file_path_qa.exists():
+            print(
+                "Error: viber.txt not found in the current directory. "
+                "Please generate it first or ensure it's present.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        print(f"QA mode enabled. viber.txt found. Repository context: {repo_path}")
+        print("Type 'exit' or 'quit' to end the session.")
+
+        try:
+            viber_content = viber_file_path_qa.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"Error: Could not read viber.txt: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        chat_history = []
+        while True:
+            user_question = input("Ask a question (or type 'exit' to quit): ")
+            if user_question.lower() in ["exit", "quit"]:
+                print("Exiting Q&A mode.")
+                break
+
+            # Actual call to handle_qa_session
+            agent_answer = handle_qa_session(user_question, viber_content, repo_path, chat_history)
+            
+            print(f"Agent: {agent_answer}") # This will print the answer or any error message from the LLM stages
+            
+            chat_history.append({"role": "user", "content": user_question})
+            # Only add assistant response to history if it's not a critical error message from handle_qa_session
+            # For simplicity now, we add everything. Refinement could be to check if agent_answer starts with "Error:"
+            chat_history.append({"role": "assistant", "content": agent_answer})
+            print() # for readability
+
+        sys.exit(0) # Exit after Q&A loop
+
+    # Original viber.txt generation logic starts here
+    # This part should only run if args.qa is False.
+
+    if not args.repo_path:
+        print(
+            "Error: --repo_path is required for viber.txt generation mode.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     repo_path = Path(args.repo_path).resolve()
-    # viber_file_path = repo_path / "viber.txt"
     viber_file_path = Path("viber.txt").resolve()
 
     if not repo_path.is_dir():
         print(f"Error: Path '{repo_path}' is not a valid directory.", file=sys.stderr)
         sys.exit(1)
 
+    # Check for existing viber.txt only in generation mode
     if viber_file_path.exists():
         print(
-            f"Info: '{viber_file_path.name}' already exists in '{repo_path}'. Skipping creation."
+            f"Info: '{viber_file_path.name}' already exists. Skipping creation."
         )
-        # Optional: Add logic here to overwrite or update if needed
-        # e.g., ask the user or add a --force flag
+        # To prevent accidental overwrites, we exit.
+        # Consider adding a --force flag if overwriting is desired.
         sys.exit(0)
 
     print(f"Analyzing repository: {repo_path}")
